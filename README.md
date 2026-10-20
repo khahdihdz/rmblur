@@ -45,6 +45,7 @@ Kiểm tra phụ thuộc: `media_clean --check`
 |------|-----------|
 | Ảnh | Xoá watermark bằng inpaint (OpenCV TELEA) hoặc ImageMagick |
 | Ảnh | **Khử mosaic/pixel**: làm mềm cạnh khối, hoặc lấp vùng bằng inpaint |
+| Ảnh/Video | **Tự phát hiện vùng mờ/mosaic** thay vì nhập toạ độ thủ công (`--auto`) |
 | Video | Xoá watermark bằng filter `delogo`, giữ nguyên audio (`-c:a copy`) |
 | Video | **Khử mosaic/pixel** theo vùng: crop → scale xuống → scale lên → boxblur → overlay |
 | Chung | Làm nét bằng `unsharp` cho ảnh và video |
@@ -76,7 +77,8 @@ Kiểm tra phụ thuộc: `media_clean --check`
 0) Thoát
 ```
 
-Khi được hỏi vùng, nhập `x:y:w:h` (pixel, gốc toạ độ góc trên-trái). Nhập nhiều vùng liên tiếp,
+Khi được hỏi vùng, menu 3/4 cho chọn **tự động phát hiện** (mặc định) hoặc **nhập tay**.
+Nhập tay dùng dạng `x:y:w:h` (pixel, gốc toạ độ góc trên-trái), nhiều vùng liên tiếp,
 Enter trống để kết thúc.
 
 ---
@@ -89,6 +91,8 @@ media_clean video FILE [x:y:w:h ...] [--deblur] [--out DIR] [--crf N]
 
 media_clean depixel-image FILE [x:y:w:h ...] [--block N] [--fill] [--deblur] [--out DIR]
 media_clean depixel-video FILE [x:y:w:h ...] [--block N] [--fill] [--deblur] [--out DIR]
+media_clean depixel-image FILE --auto [--fill] [--block N] [--out DIR]
+media_clean depixel-video FILE --auto [--fill] [--block N] [--out DIR]
 
 media_clean --check | --help | --version
 ```
@@ -107,6 +111,10 @@ media_clean depixel-image face.png 110:60:180:180 --block 6
 
 # Mosaic trên video, lấp vùng thay vì làm mềm
 media_clean depixel-video in.mp4 300:200:160:120 --fill
+
+# Tự phát hiện vùng mờ/mosaic (ảnh và video)
+media_clean depixel-image face.png --auto
+media_clean depixel-video in.mp4 --auto --fill
 ```
 
 Output mặc định: `<tên>_clean.<ext>` (watermark) hoặc `<tên>_depixel.<ext>` (mosaic).
@@ -127,6 +135,25 @@ phục hồi được chi tiết gốc. Script cung cấp 2 hướng, chọn the
 **Chọn `--block`:** đây là kích thước một ô mosaic tính bằng pixel. Mở ảnh, phóng to đến khi
 thấy lưới ô, đếm chiều rộng một ô. Chọn sai lệch nhiều thì kết quả vẫn còn lưới (block nhỏ hơn
 thực tế) hoặc bị nhoè quá mức (block lớn hơn nhiều).
+
+---
+
+## Tự động phát hiện vùng mờ / mosaic
+
+Menu 3/4 hỏi **Tự động phát hiện** (mặc định) hay **Nhập tay**. Script trích frame, phân tích
+độ chi tiết cục bộ rồi đề xuất các vùng chữ nhật; bạn xác nhận trước khi xử lý.
+
+Với video, script lấy 3 frame (25%, 50%, 75%) và chỉ giữ vùng ổn định ở phần lớn frame —
+phù hợp mosaic/watermark tĩnh.
+
+**Cách hoạt động:** chia ảnh thành lưới ô 8px, tính độ lệch chuẩn từng ô. Ô "ít chi tiết" hơn
+hẳn vòng quanh được dùng làm hạt giống rồi nở thành vùng. Vùng có lưới biên đều (block score
+cao) được xếp là **mosaic**, còn lại là **mờ mềm**. Toàn bộ chạy bằng Python thuần — không cần
+`numpy`, `OpenCV` hay gói pip nào.
+
+**Hạn chế:** ảnh test-card, đồ hoạ nhiều mảng phẳng, hoặc vùng mờ nằm trên nền trơn có thể bị
+bỏ sót hoặc báo nhầm. Kết quả luôn là đề xuất để bạn duyệt; nếu sai, chọn nhập tay.
+Tự phát hiện chạy ở tối đa 1280px (ảnh) và 960px (video) để giữ tốc độ trên điện thoại.
 
 ---
 
@@ -185,6 +212,8 @@ Menu → `10`, hoặc sửa `~/.media_clean/settings.conf`:
 | `No module named cv2` | `pip install opencv-python-headless`, hoặc để fallback ImageMagick |
 | Khử mosaic xong vẫn thấy lưới | `--block` nhỏ hơn kích thước khối thật, tăng lên |
 | Khử mosaic bị nhoè cả vùng | `--block` quá lớn, giảm xuống; hoặc dùng `--fill` |
+| `--auto` không tìm thấy vùng | vùng quá nhỏ/nằm trên nền trơn, hoặc ảnh đồ hoạ phẳng; nhập tay |
+| `--auto` báo thừa vùng | chọn "không" khi xác nhận rồi nhập tay vùng đúng |
 | Ảnh ra nhoè cả vùng lớn | vùng chọn quá rộng, hoặc `INPAINT_RADIUS` lớn (thử 3–5) |
 
 Log: `~/.media_clean/logs/`.

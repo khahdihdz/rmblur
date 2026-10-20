@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # =============================================================================
-#  media_clean.sh  ·  Xoá watermark tĩnh + khử mosaic/pixel + làm nét
-#  Version : 1.1.0
+#  media_clean.sh  ·  Watermark + mosaic/pixel + làm nét + tự phát hiện vùng
+#  Version : 1.3.0
 #  Repo    : https://github.com/khahdihdz/rmblur
 #
 #  Cài nhanh:
@@ -15,7 +15,7 @@ set -o pipefail
 shopt -s nullglob
 
 APP_NAME="media_clean"
-VERSION="1.1.0"
+VERSION="1.3.0"
 
 # ----------------------------- màu -------------------------------------------
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -46,6 +46,9 @@ UNSHARP_VID="5:5:1.0:5:5:0.0"
 INPAINT_RADIUS=7
 MOSAIC_BLOCK=8
 MOSAIC_METHOD="smooth"
+AUTO_DETECT=0
+DETECT_MAX_IMAGE=1280
+DETECT_MAX_VIDEO=960
 OUT_DIR="$PWD/output"
 
 # ----------------------------- trạng thái ------------------------------------
@@ -531,6 +534,552 @@ process_image_depixel() {
   finish_image "$work" "$out" "$in"
 }
 
+# ----------------------------- tự động phát hiện vùng mờ ---------------------
+python_bin() {
+  if command -v python >/dev/null 2>&1; then printf 'python'; return 0; fi
+  if command -v python3 >/dev/null 2>&1; then printf 'python3'; return 0; fi
+  return 1
+}
+
+have_python() {
+  python_bin >/dev/null 2>&1
+}
+
+write_detect_helper() {
+  ensure_tmp
+  local py="$TMP_DIR/detect.py"
+  [[ -f "$py" ]] && return 0
+  cat >"$py" <<'PYDETECT'
+#!/usr/bin/env python3
+"""Phat hien vung mo / mosaic (pixel hoa) trong anh RGB raw.
+
+    detect.py W H KIND raw1 [raw2 ...]
+
+In ra moi dong mot vung: x:y:w:h. KIND: any | mosaic | blur
+"""
+import sys
+from math import sqrt
+
+CELL = 8
+SEED_RATIO = 0.45
+RING_R = 2
+MIN_RING = 2.0
+GROW_MAX = 6.0
+MIN_AREA = 0.002
+MAX_AREA = 0.25
+MOSAIC_BLOCK = 2.2
+
+
+def load_gray(path, w, h):
+    with open(path, "rb") as fh:
+        data = fh.read(w * h * 3)
+    if len(data) < w * h * 3:
+        raise SystemExit("raw khong du du lieu")
+    gray = [0] * (w * h)
+    for p in range(w * h):
+        b = p * 3
+        gray[p] = (data[b] + data[b + 1] + data[b + 2]) // 3
+    return gray
+
+
+def integral(a, w, h):
+    ii = [0] * ((w + 1) * (h + 1))
+    sw = w + 1
+    for y in range(h):
+        acc = 0
+        row = y * w
+        base = (y + 1) * sw
+        up = y * sw
+        for x in range(w):
+            acc += a[row + x]
+            ii[base + x + 1] = ii[up + x + 1] + acc
+    return ii
+
+
+def rect_sum(ii, w, x0, y0, x1, y1):
+    sw = w + 1
+    return (ii[y1 * sw + x1] - ii[y0 * sw + x1]
+            - ii[y1 * sw + x0] + ii[y0 * sw + x0])
+
+
+def cell_std(gray, w, h):
+    cw = max(1, w // CELL)
+    ch = max(1, h // CELL)
+    out = [0.0] * (cw * ch)
+    ii = integral(gray, w, h)
+    ii2 = integral([v * v for v in gray], w, h)
+    for cy in range(ch):
+        y0 = cy * CELL
+        y1 = min(h, y0 + CELL)
+        for cx in range(cw):
+            x0 = cx * CELL
+            x1 = min(w, x0 + CELL)
+            n = (y1 - y0) * (x1 - x0)
+            m = rect_sum(ii, w, x0, y0, x1, y1) / n
+            m2 = rect_sum(ii2, w, x0, y0, x1, y1) / n
+            var = m2 - m * m
+            out[cy * cw + cx] = sqrt(var) if var > 0 else 0.0
+    return out, cw, ch
+
+
+def ring_mean(std, cw, ch, r=RING_R):
+    out = [0.0] * (cw * ch)
+    for cy in range(ch):
+        for cx in range(cw):
+            total = 0.0
+            n = 0
+            for y in range(max(0, cy - r), min(ch, cy + r + 1)):
+                base = y * cw
+                for x in range(max(0, cx - r), min(cw, cx + r + 1)):
+                    if x == cx and y == cy:
+                        continue
+                    total += std[base + x]
+                    n += 1
+            out[cy * cw + cx] = total / n if n else 0.0
+    return out
+
+
+def components(mask, cw, ch, min_cells=2):
+    seen = [False] * (cw * ch)
+    boxes = []
+    for start in range(cw * ch):
+        if not mask[start] or seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        minx = maxx = start % cw
+        miny = maxy = start // cw
+        count = 0
+        while stack:
+            cur = stack.pop()
+            count += 1
+            cx = cur % cw
+            cy = cur // cw
+            if cx < minx:
+                minx = cx
+            if cx > maxx:
+                maxx = cx
+            if cy < miny:
+                miny = cy
+            if cy > maxy:
+                maxy = cy
+            for ny in range(max(0, cy - 1), min(ch, cy + 2)):
+                row = ny * cw
+                for nx in range(max(0, cx - 1), min(cw, cx + 2)):
+                    n = row + nx
+                    if mask[n] and not seen[n]:
+                        seen[n] = True
+                        stack.append(n)
+        if count >= min_cells:
+            boxes.append((minx, miny, maxx, maxy, count))
+    return boxes
+
+
+def block_score(gray, w, x0, y0, x1, y1):
+    span = x1 - x0 - 1
+    if span < 8:
+        return 0.0
+    cols = [0.0] * span
+    for y in range(y0, y1):
+        row = y * w
+        for x in range(x0, x0 + span):
+            d = gray[row + x + 1] - gray[row + x]
+            if d < 0:
+                d = -d
+            cols[x - x0] += d
+    total = sum(cols) / len(cols) + 1e-9
+    best = 0.0
+    for b in range(4, 49):
+        idx = list(range(b - 1, span, b))
+        if len(idx) < 3:
+            continue
+        val = sum(cols[i] for i in idx) / len(idx)
+        score = val / total
+        if score > best:
+            best = score
+    return best
+
+
+def inside_mean(std, cw, x0, y0, x1, y1):
+    total = 0.0
+    n = 0
+    for y in range(y0, y1):
+        base = y * cw
+        for x in range(x0, x1):
+            total += std[base + x]
+            n += 1
+    return total / n if n else 0.0
+
+
+def iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0 = max(ax, bx)
+    y0 = max(ay, by)
+    x1 = min(ax + aw, bx + bw)
+    y1 = min(ay + ah, by + bh)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    inter = (x1 - x0) * (y1 - y0)
+    return inter / float(aw * ah + bw * bh - inter)
+
+
+def _near(a, b, gap=4):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return not (ax + aw + gap <= bx or bx + bw + gap <= ax
+                or ay + ah + gap <= by or by + bh + gap <= ay)
+
+
+def merge_boxes(boxes):
+    boxes = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        n = len(boxes)
+        for i in range(n):
+            if boxes[i] is None:
+                continue
+            for j in range(i + 1, n):
+                if boxes[j] is None:
+                    continue
+                if _near(boxes[i], boxes[j]):
+                    a, b = boxes[i], boxes[j]
+                    x0 = min(a[0], b[0])
+                    y0 = min(a[1], b[1])
+                    x1 = max(a[0] + a[2], b[0] + b[2])
+                    y1 = max(a[1] + a[3], b[1] + b[3])
+                    boxes[i] = (x0, y0, x1 - x0, y1 - y0)
+                    boxes[j] = None
+                    changed = True
+        boxes = [b for b in boxes if b is not None]
+    return boxes
+
+
+def grow(seed_comp, std, cw, ch, thr):
+    x0, y0, x1, y1, _ = seed_comp
+    seen = set()
+    stack = []
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            seen.add((x, y))
+            stack.append((x, y))
+    while stack:
+        x, y = stack.pop()
+        for ny in (y - 1, y, y + 1):
+            if ny < 0 or ny >= ch:
+                continue
+            row = ny * cw
+            for nx in (x - 1, x, x + 1):
+                if nx < 0 or nx >= cw:
+                    continue
+                if (nx, ny) in seen:
+                    continue
+                if std[row + nx] < thr:
+                    seen.add((nx, ny))
+                    stack.append((nx, ny))
+    xs = [p[0] for p in seen]
+    ys = [p[1] for p in seen]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def detect(raw_path, w, h, kind):
+    gray = load_gray(raw_path, w, h)
+    std, cw, ch = cell_std(gray, w, h)
+    ring = ring_mean(std, cw, ch)
+
+    seeds = [0] * (cw * ch)
+    for i, v in enumerate(std):
+        if ring[i] >= MIN_RING and v < SEED_RATIO * ring[i]:
+            seeds[i] = 1
+
+    comps = components(seeds, cw, ch, 2)
+    boxes = []
+    frame = float(w * h)
+
+    for comp in comps:
+        x0, y0, x1, y1, _ = comp
+        ringmax = max(ring[y * cw + x]
+                      for y in range(y0, y1 + 1)
+                      for x in range(x0, x1 + 1))
+        thr = max(0.8, min(0.7 * ringmax, GROW_MAX))
+        gx0, gy0, gx1, gy1 = grow(comp, std, cw, ch, thr)
+
+        bw = (gx1 - gx0 + 1) * CELL
+        bh = (gy1 - gy0 + 1) * CELL
+        area = (bw * bh) / frame
+        if area < MIN_AREA or area > MAX_AREA:
+            continue
+
+        ins = inside_mean(std, cw, gx0, gy0, gx1 + 1, gy1 + 1)
+        ox0 = max(0, gx0 - RING_R)
+        oy0 = max(0, gy0 - RING_R)
+        ox1 = min(cw, gx1 + RING_R + 1)
+        oy1 = min(ch, gy1 + RING_R + 1)
+        total = 0.0
+        n = 0
+        for yy in range(oy0, oy1):
+            base = yy * cw
+            for xx in range(ox0, ox1):
+                if gx0 <= xx <= gx1 and gy0 <= yy <= gy1:
+                    continue
+                total += std[base + xx]
+                n += 1
+        out = total / n if n else 0.0
+
+        if out < 2.0:
+            continue
+
+        if (bh > 0.7 * h and bw < 0.25 * w) or (bw > 0.7 * w and bh < 0.25 * h):
+            continue
+
+        x = gx0 * CELL
+        y = gy0 * CELL
+        bw = min(w - x, (gx1 - gx0 + 1) * CELL)
+        bh = min(h - y, (gy1 - gy0 + 1) * CELL)
+
+        score = block_score(gray, w, x, y, x + bw, y + bh)
+        is_mosaic = score >= MOSAIC_BLOCK
+
+        # Mosaic co luoi deu ro rang thi chap nhan ca khi tuong phan vien yeu.
+        if is_mosaic:
+            if out < ins * 1.05:
+                continue
+        else:
+            if out < ins * 1.8:
+                continue
+            if ins < 0.5:
+                continue
+
+        if kind == "mosaic" and not is_mosaic:
+            continue
+        if kind == "blur" and is_mosaic:
+            continue
+        boxes.append((x, y, bw, bh))
+
+    return merge_boxes(boxes)
+
+
+def cluster(boxes, need):
+    groups = []
+    for box in boxes:
+        placed = False
+        for g in groups:
+            if any(iou(box, other) >= 0.4 for other in g):
+                g.append(box)
+                placed = True
+                break
+        if not placed:
+            groups.append([box])
+    out = []
+    for g in groups:
+        if len(g) < need:
+            continue
+        xs = sorted(b[0] for b in g)
+        ys = sorted(b[1] for b in g)
+        xe = sorted(b[0] + b[2] for b in g)
+        ye = sorted(b[1] + b[3] for b in g)
+        mid = len(g) // 2
+        x = xs[mid]
+        y = ys[mid]
+        out.append((x, y, xe[mid] - x, ye[mid] - y))
+    return out
+
+
+def main():
+    if len(sys.argv) < 5:
+        sys.stderr.write("usage: detect.py W H KIND raw...\n")
+        return 2
+    w = int(sys.argv[1])
+    h = int(sys.argv[2])
+    kind = sys.argv[3]
+    raws = sys.argv[4:]
+
+    sets = [detect(r, w, h, kind) for r in raws]
+    if len(sets) == 1:
+        boxes = sets[0]
+    else:
+        need = max(2, (len(sets) + 1) // 2)
+        boxes = cluster([b for s in sets for b in s], need)
+
+    for (x, y, bw, bh) in boxes:
+        x = max(0, x - 2)
+        y = max(0, y - 2)
+        bw = min(w - x, bw + 4)
+        bh = min(h - y, bh + 4)
+        print("%d:%d:%d:%d" % (x, y, bw, bh))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYDETECT
+}
+
+scale_dims() {
+  local w="$1" h="$2" max="$3" dw dh
+  if (( w <= max )); then
+    printf '%s %s\n' "$w" "$h"
+    return 0
+  fi
+  dw="$max"
+  dh=$(( h * max / w ))
+  (( dh < 16 )) && dh=16
+  printf '%s %s\n' "$dw" "$dh"
+}
+
+scale_box_back() {
+  local box="$1" W="$2" H="$3" dw="$4" dh="$5"
+  local x y w h
+  IFS=: read -r x y w h <<<"$box"
+  x=$(( x * W / dw ))
+  y=$(( y * H / dh ))
+  w=$(( w * W / dw ))
+  h=$(( h * H / dh ))
+  (( x < 0 )) && x=0
+  (( y < 0 )) && y=0
+  (( x + w > W )) && w=$(( W - x ))
+  (( y + h > H )) && h=$(( H - y ))
+  (( w > 0 && h > 0 )) || return 1
+  printf '%s:%s:%s:%s\n' "$x" "$y" "$w" "$h"
+}
+
+detect_regions_image() {
+  local in="$1" kind="${2:-any}"
+  local size W H dw dh raw py boxes
+  local -a line found=()
+  local scalar
+
+  [[ -f "$in" ]] || return 1
+  have_python || return 1
+  detect_im
+  [[ ${#IDENTIFY_BIN[@]} -gt 0 ]] || return 1
+
+  size=$(probe_image_size "$in" 2>/dev/null) || return 1
+  W="${size% *}"; H="${size#* }"
+  [[ "$W" =~ ^[0-9]+$ && "$H" =~ ^[0-9]+$ ]] || return 1
+  read -r dw dh < <(scale_dims "$W" "$H" "$DETECT_MAX_IMAGE")
+
+  ensure_tmp
+  write_detect_helper
+  raw="$TMP_DIR/detect_img_$$.raw"
+  "${IM_BIN[@]}" "${in}[0]" -resize "${dw}x${dh}!" -alpha off \
+    -depth 8 -colorspace sRGB "rgb:$raw" 2>>"$LOGFILE" || return 1
+
+  py=$(python_bin) || return 1
+  boxes=$("$py" "$TMP_DIR/detect.py" "$dw" "$dh" "$kind" "$raw" 2>>"$LOGFILE") || return 1
+  rm -f -- "$raw"
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    scalar=$(scale_box_back "$line" "$W" "$H" "$dw" "$dh") || continue
+    [[ -n "$scalar" ]] && found+=("$scalar")
+  done <<<"$boxes"
+
+  (( ${#found[@]} > 0 )) || return 1
+  printf '%s\n' "${found[@]}"
+}
+
+detect_regions_video() {
+  local in="$1" kind="${2:-any}"
+  local size W H dw dh dur t raw py boxes line
+  local -a raws=() found=()
+  local scalar
+
+  [[ -f "$in" ]] || return 1
+  have_python || return 1
+
+  size=$(probe_video_size "$in") || return 1
+  W="${size%x*}"; H="${size#*x}"
+  [[ "$W" =~ ^[0-9]+$ && "$H" =~ ^[0-9]+$ ]] || return 1
+  read -r dw dh < <(scale_dims "$W" "$H" "$DETECT_MAX_VIDEO")
+  dur=$(probe_duration_ms "$in")
+
+  ensure_tmp
+  write_detect_helper
+
+  local i
+  for i in 1 2 3; do
+    if (( dur > 0 )); then
+      t=$(awk -v d="$dur" -v i="$i" 'BEGIN { printf "%.3f", (d / 1000) * i / 4 }')
+    else
+      t=0
+    fi
+    raw="$TMP_DIR/detect_v_$$_$i.raw"
+    if ffmpeg -hide_banner -loglevel error -ss "$t" -i "$in" -frames:v 1 \
+        -vf "scale=${dw}:${dh}:flags=lanczos" -f rawvideo -pix_fmt rgb24 -y "$raw" \
+        >/dev/null 2>&1 && [[ -s "$raw" ]]; then
+      raws+=("$raw")
+    fi
+  done
+
+  if (( ${#raws[@]} == 0 )); then
+    rm -f -- "$TMP_DIR"/detect_v_$$_*.raw
+    return 1
+  fi
+
+  py=$(python_bin) || { rm -f -- "${raws[@]}"; return 1; }
+  boxes=$("$py" "$TMP_DIR/detect.py" "$dw" "$dh" "$kind" "${raws[@]}" 2>>"$LOGFILE") || {
+    rm -f -- "${raws[@]}"
+    return 1
+  }
+  rm -f -- "${raws[@]}"
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    scalar=$(scale_box_back "$line" "$W" "$H" "$dw" "$dh") || continue
+    [[ -n "$scalar" ]] && found+=("$scalar")
+  done <<<"$boxes"
+
+  (( ${#found[@]} > 0 )) || return 1
+  printf '%s\n' "${found[@]}"
+}
+
+ask_regions_auto() {
+  local kind="$1" path="$2"
+  local -a found=()
+  local r
+
+  printf '%sCách xác định vùng:%s\n  1) Tự động phát hiện vùng mờ/mosaic (mặc định)\n  2) Nhập toạ độ thủ công\n' "$C_D" "$C_0"
+  ask "Chọn" "1"
+  if [[ "$REPLY" == "2" ]]; then
+    ask_regions && return 0
+    return 1
+  fi
+
+  if ! have_python; then
+    warn "Cần python để tự động phát hiện: pkg install python"
+    ask_regions && return 0
+    return 1
+  fi
+
+  info "Đang phân tích ${path##*/} ..."
+  if [[ "$kind" == "image" ]]; then
+    mapfile -t found < <(detect_regions_image "$path")
+  else
+    mapfile -t found < <(detect_regions_video "$path")
+  fi
+
+  if (( ${#found[@]} == 0 )); then
+    warn "Không phát hiện được vùng nào (ảnh test-card/đồ hoạ phẳng dễ bị bỏ sót)"
+    ask_regions && return 0
+    return 1
+  fi
+
+  REGIONS=("${found[@]}")
+  info "Phát hiện ${#REGIONS[@]} vùng:"
+  for r in "${REGIONS[@]}"; do
+    printf '    %s\n' "$r"
+  done
+
+  if confirm "Dùng các vùng này?" "y"; then
+    return 0
+  fi
+  REGIONS=()
+  ask_regions && return 0
+  return 1
+}
+
 # ----------------------------- video -----------------------------------------
 build_video_filter() {
   local -a parts=()
@@ -813,7 +1362,7 @@ menu_depixel_image() {
   size=$(probe_image_size "$in" 2>/dev/null) || size=""
   [[ -n "$size" ]] && info "Kích thước ảnh: ${size% *}x${size#* }"
 
-  ask_regions || { err "Cần ít nhất 1 vùng mosaic"; return 1; }
+  ask_regions_auto image "$in" || { err "Cần ít nhất 1 vùng"; return 1; }
   info "Sẽ xử lý ${#REGIONS[@]} vùng"
   ask_mosaic_method
 
@@ -845,7 +1394,7 @@ menu_depixel_video() {
   [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { err "Không đọc được video: $in"; return 1; }
   info "Kích thước video: ${size/x/ x } · $(( $(probe_duration_ms "$in") / 1000 )) giây"
 
-  ask_regions || { err "Cần ít nhất 1 vùng mosaic"; return 1; }
+  ask_regions_auto video "$in" || { err "Cần ít nhất 1 vùng"; return 1; }
   info "Sẽ xử lý ${#REGIONS[@]} vùng"
   ask_mosaic_method
 
@@ -868,8 +1417,8 @@ menu_depixel_video() {
 }
 
 menu_batch() {
-  local kind="$1" mode="${2:-clean}" dir outdir r f base ext out n=0 failed=0
-  local -a files=() exts=() list=()
+  local kind="$1" mode="${2:-clean}" dir outdir r f base ext out n=0 failed=0 auto=0
+  local -a files=() exts=() list=() det=()
   local -A seen=()
 
   if [[ "$mode" == "ask" ]]; then
@@ -907,7 +1456,16 @@ menu_batch() {
 
   info "Tìm thấy ${#list[@]} file $kind"
 
-  if ask_regions; then
+  if [[ "$mode" == "depixel" ]]; then
+    if have_python && confirm "Tự động phát hiện vùng cho từng file?" "n"; then
+      auto=1
+    fi
+  fi
+
+  if (( auto == 1 )); then
+    REGIONS=()
+    info "Sẽ tự phát hiện vùng cho từng file"
+  elif ask_regions; then
     info "Áp dụng ${#REGIONS[@]} vùng cho tất cả file"
   else
     warn "Không có vùng nào, chỉ chạy làm nét"
@@ -932,6 +1490,21 @@ menu_batch() {
     [[ "$f" == *.* ]] && ext="${f##*/}"; ext="${ext##*.}"
     out=$(unique_out "$outdir/${base}${suffix}" "$ext")
     printf '\n%s[%d/%d]%s %s\n' "$C_B" "$n" "$total" "$C_0" "${f##*/}"
+    if [[ "$mode" == "depixel" ]] && (( auto == 1 )); then
+      det=()
+      if [[ "$kind" == "image" ]]; then
+        mapfile -t det < <(detect_regions_image "$f")
+      else
+        mapfile -t det < <(detect_regions_video "$f")
+      fi
+      if (( ${#det[@]} == 0 )); then
+        warn "Không phát hiện được vùng, bỏ qua file này"
+        failed=$((failed + 1))
+        continue
+      fi
+      REGIONS=("${det[@]}")
+      info "Tự phát hiện ${#det[@]} vùng"
+    fi
     if [[ "$kind" == "image" ]]; then
       if [[ "$mode" == "depixel" ]]; then
         process_image_depixel "$f" "$out" || { failed=$((failed + 1)); continue; }
@@ -1177,6 +1750,12 @@ check_deps() {
     warn "OpenCV (python cv2): không có → dùng ImageMagick để xoá watermark ảnh"
   fi
 
+  if have_python; then
+    ok "python (tự phát hiện vùng): có"
+  else
+    warn "python: không có → không dùng được --auto"
+  fi
+
   if [[ ${#missing[@]} -eq 0 ]]; then
     ok "Đủ phụ thuộc"
     return 0
@@ -1219,11 +1798,13 @@ CÁCH DÙNG
   $APP_NAME video FILE [x:y:w:h ...] [--deblur] [--out DIR] [--crf N]
   $APP_NAME depixel-image FILE [x:y:w:h ...] [--block N] [--fill] [--deblur]
   $APP_NAME depixel-video FILE [x:y:w:h ...] [--block N] [--fill] [--deblur]
+  $APP_NAME depixel-image FILE --auto [--fill] [--block N]
+  $APP_NAME depixel-video FILE --auto [--fill] [--block N]
 
 VÍ DỤ
   $APP_NAME video clip.mp4 900:20:180:60 20:60:120:40
   $APP_NAME image logo.png 100:100:200:80 --deblur
-  $APP_NAME depixel-video in.mp4 300:200:160:120 --block 8
+  $APP_NAME depixel-video in.mp4 --auto
   $APP_NAME depixel-image face.png 120:80:200:200 --fill --deblur
 
 GHI CHÚ
@@ -1231,6 +1812,7 @@ GHI CHÚ
   - Khử mosaic chỉ làm mềm cạnh khối hoặc lấp vùng; KHÔNG phục hồi chi tiết gốc.
   - Làm nét chỉ tăng tương phản cạnh, không tái tạo chi tiết đã mất.
   - --fill: lấp vùng bằng nội dung xung quanh (inpaint/delogo), mặc định là smooth.
+  - --auto: tự phát hiện vùng mờ/mosaic (chỉ cần python, không cần thêm gói).
   - Chỉ dùng cho nội dung bạn sở hữu hoặc có quyền chỉnh sửa.
 EOF
 }
@@ -1258,6 +1840,7 @@ cli_mode() {
         ;;
       --fill) MOSAIC_METHOD="fill"; shift ;;
       --smooth) MOSAIC_METHOD="smooth"; shift ;;
+      --auto) AUTO_DETECT=1; shift ;;
       -h|--help) usage; return 0 ;;
       --) shift; while [[ $# -gt 0 ]]; do pos+=("$1"); shift; done ;;
       -*) err "Tham số không hỗ trợ: $1"; return 2 ;;
@@ -1280,6 +1863,28 @@ cli_mode() {
       return 2
     fi
   done
+
+  if [[ "$mode" == depixel-* ]] && (( AUTO_DETECT == 1 )) && (( ${#REGIONS[@]} == 0 )); then
+    if ! have_python; then
+      err "Tự động phát hiện cần python: pkg install python"
+      return 1
+    fi
+    local -a det=()
+    info "Đang tự phát hiện vùng mờ/mosaic ..."
+    if [[ "$mode" == "depixel-image" ]]; then
+      mapfile -t det < <(detect_regions_image "$f")
+    else
+      mapfile -t det < <(detect_regions_video "$f")
+    fi
+    if (( ${#det[@]} == 0 )); then
+      err "Không phát hiện được vùng nào, hãy nhập toạ độ thủ công"
+      return 1
+    fi
+    REGIONS=("${det[@]}")
+    info "Phát hiện ${#REGIONS[@]} vùng:"
+    local rr
+    for rr in "${REGIONS[@]}"; do printf '    %s\n' "$rr"; done
+  fi
 
   OUT_DIR="${outdir:-$OUT_DIR}"
   OUT_DIR=$(expand_path "$OUT_DIR")

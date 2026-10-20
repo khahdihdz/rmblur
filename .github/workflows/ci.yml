@@ -62,4 +62,16 @@ jobs:
           bash media_clean.sh depixel-image demo.png 20:20:80:60 --block 8 --out out
           test -s out/demo_depixel.png
 
+          # Tự phát hiện: tạo vùng mosaic trên nền plasma rồi để script tự tìm
+          convert -size 480x360 plasma:fractal auto_base.png
+          convert auto_base.png \( +clone -crop 160x120+120+80 +repage \
+            -filter box -resize 20x15! -resize 160x120! \) \
+            -geometry +120+80 -composite auto_mosaic.png
+          bash media_clean.sh depixel-image auto_mosaic.png --auto --out out
+          test -s out/auto_mosaic_depixel.png
+          ffmpeg -hide_banner -loglevel error -loop 1 -i auto_mosaic.png -t 1 -r 10 \
+            -pix_fmt yuv420p -y auto.mp4
+          bash media_clean.sh depixel-video auto.mp4 --auto --out out
+          test -s out/auto_depixel.mp4
+
           echo "SMOKE OK"
