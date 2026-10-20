@@ -1,0 +1,6 @@
+output/
+out*/
+cleaned/
+preview_*.png
+*.log
+.DS_Store
