@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kiểm tra cú pháp bash
+        run: |
+          bash -n media_clean.sh
+          bash -n install.sh
+          bash -n get.sh
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning media_clean.sh install.sh get.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cài ffmpeg + ImageMagick
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg imagemagick
+
+      - name: Smoke test (video + ảnh, watermark + mosaic)
+        run: |
+          set -euxo pipefail
+          bash media_clean.sh --version
+          bash media_clean.sh --help >/dev/null
+
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i testsrc=size=320x240:rate=10 \
+            -f lavfi -i sine=frequency=440 -t 1 \
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest in.mp4
+
+          bash media_clean.sh video in.mp4 10:10:80:40 --out out
+          test -s out/in_clean.mp4
+          ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 out/in_clean.mp4 | grep -q audio
+
+          bash media_clean.sh depixel-video in.mp4 10:10:80:40 --block 8 --out out
+          test -s out/in_depixel.mp4
+
+          bash media_clean.sh depixel-video in.mp4 10:10:80:40 --fill --out out
+          test -s out/in_depixel_1.mp4
+
+          convert -size 200x150 plasma: demo.png
+          bash media_clean.sh image demo.png 20:20:80:60 --deblur --out out
+          test -s out/demo_clean.png
+
+          bash media_clean.sh depixel-image demo.png 20:20:80:60 --block 8 --out out
+          test -s out/demo_depixel.png
+
+          echo "SMOKE OK"
